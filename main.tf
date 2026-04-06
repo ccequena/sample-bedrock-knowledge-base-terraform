@@ -45,18 +45,15 @@ resource "aws_iam_role_policy" "bedrock_kb_claude_opus" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "AllowClaudeOpusInferenceProfile"
-        Effect = "Allow"
-        Action = [
-          "bedrock:GetInferenceProfile",
-          "bedrock:InvokeModel",
-          "bedrock:InvokeModelWithResponseStream"
-        ]
-        Resource = local.claude_opus_inference_profile_arn
-      }
-    ]
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "bedrock:GetInferenceProfile",
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ]
+      Resource = local.claude_opus_inference_profile_arn
+    }]
   })
 }
 
@@ -69,16 +66,11 @@ resource "aws_iam_role_policy" "bedrock_kb_titan_embeddings" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "AllowTitanEmbeddingModel"
-        Effect = "Allow"
-        Action = [
-          "bedrock:InvokeModel"
-        ]
-        Resource = local.bedrock_embedding_model_arn
-      }
-    ]
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["bedrock:InvokeModel"]
+      Resource = local.bedrock_embedding_model_arn
+    }]
   })
 }
 
@@ -90,6 +82,59 @@ data "aws_s3_bucket" "kb" {
 }
 
 ########################################
+# IAM Policy – OpenSearch Serverless access (REQUIRED)
+########################################
+resource "aws_iam_role_policy" "bedrock_kb_opensearch" {
+  name = "BedrockKBOpenSearchAccess-${var.kb_name}"
+  role = aws_iam_role.bedrock_kb.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "aoss:APIAccessAll"
+        ]
+        Resource = aws_opensearchserverless_collection.kb.arn
+      }
+    ]
+  })
+}
+
+########################################
+# OpenSearch Serverless Access Policy (VALID)
+########################################
+resource "aws_opensearchserverless_access_policy" "kb" {
+  name = var.kb_oss_collection_name
+  type = "data"
+
+  policy = jsonencode([
+    {
+      Rules = [
+        {
+          ResourceType = "index"
+          Resource     = ["index/${var.kb_oss_collection_name}/*"]
+          Permission = [
+            "aoss:CreateIndex",
+            "aoss:DeleteIndex",
+            "aoss:DescribeIndex",
+            "aoss:ReadDocument",
+            "aoss:UpdateIndex",
+            "aoss:WriteDocument"
+          ]
+        }
+      ],
+      Principal = [
+        aws_iam_role.bedrock_kb.arn,
+        data.aws_caller_identity.this.arn
+      ]
+    }
+  ])
+}
+
+
+########################################
 # OpenSearch Serverless Policies
 ########################################
 resource "aws_opensearchserverless_security_policy" "encryption" {
@@ -97,12 +142,10 @@ resource "aws_opensearchserverless_security_policy" "encryption" {
   type = "encryption"
 
   policy = jsonencode({
-    Rules = [
-      {
-        ResourceType = "collection"
-        Resource     = ["collection/${var.kb_oss_collection_name}"]
-      }
-    ]
+    Rules = [{
+      ResourceType = "collection"
+      Resource     = ["collection/${var.kb_oss_collection_name}"]
+    }]
     AWSOwnedKey = true
   })
 }
@@ -136,6 +179,7 @@ resource "aws_opensearchserverless_collection" "kb" {
   type = "VECTORSEARCH"
 
   depends_on = [
+    aws_opensearchserverless_access_policy.kb,
     aws_opensearchserverless_security_policy.encryption,
     aws_opensearchserverless_security_policy.network
   ]
@@ -150,18 +194,36 @@ provider "opensearch" {
 }
 
 ########################################
-# OpenSearch Vector Index
+# OpenSearch Vector Index (FAISS REQUIRED)
 ########################################
 resource "opensearch_index" "kb" {
-  name      = "bedrock-knowledge-base-default-index"
-  index_knn = true
+  name               = "bedrock-knowledge-base-default-index"
+  number_of_shards   = 2
+  number_of_replicas = 0
+  index_knn          = true
+
+  # Force recreation if needed
+  # force_destroy = true
+
+  depends_on = [
+    aws_opensearchserverless_collection.kb
+  ]
 
   mappings = <<EOF
 {
   "properties": {
     "bedrock-knowledge-base-default-vector": {
       "type": "knn_vector",
-      "dimension": 1024
+      "dimension": 1024,
+      "method": {
+        "name": "hnsw",
+        "engine": "faiss",
+        "space_type": "l2",
+        "parameters": {
+          "m": 16,
+          "ef_construction": 512
+        }
+      }
     },
     "AMAZON_BEDROCK_TEXT_CHUNK": {
       "type": "text"
@@ -207,7 +269,7 @@ resource "aws_bedrockagent_knowledge_base" "kb" {
 }
 
 ########################################
-# Bedrock Data Source + Parsing + Chunking
+# Bedrock Data Source
 ########################################
 resource "aws_bedrockagent_data_source" "kb" {
   knowledge_base_id = aws_bedrockagent_knowledge_base.kb.id
@@ -223,7 +285,6 @@ resource "aws_bedrockagent_data_source" "kb" {
 
   vector_ingestion_configuration {
 
-    # Claude Opus parses documents
     parsing_configuration {
       parsing_strategy = "BEDROCK_FOUNDATION_MODEL"
 
@@ -232,7 +293,6 @@ resource "aws_bedrockagent_data_source" "kb" {
       }
     }
 
-    # Hierarchical chunking
     chunking_configuration {
       chunking_strategy = var.chunking_strategy
 
