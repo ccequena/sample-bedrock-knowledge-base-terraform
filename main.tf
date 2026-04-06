@@ -1,46 +1,252 @@
-provider "aws" {
-  region = "us-west-2" # Update this to your desired AWS region
-  
+########################################
+# Data sources
+########################################
+data "aws_caller_identity" "this" {}
+data "aws_partition" "this" {}
+data "aws_region" "this" {}
+
+########################################
+# Locals
+########################################
+locals {
+  account_id = data.aws_caller_identity.this.account_id
+  partition  = data.aws_partition.this.partition
+  region     = data.aws_region.this.name
+
+  bedrock_embedding_model_arn = "arn:${local.partition}:bedrock:${local.region}::foundation-model/${var.kb_model_id}"
+
+  claude_opus_inference_profile_arn = "arn:aws:bedrock:us-west-2:520297669273:inference-profile/us.anthropic.claude-opus-4-5-20251101-v1:0"
 }
 
-module "knowledge_base" {
-  source = "./modules"
-  chunking_strategy = "HIERARCHICAL"
-  kb_model_id = "amazon.titan-embed-text-v2:0"
-  kb_name = "USORE-literature-kb-10971-D002"
-  kb_s3_bucket_name_prefix = "tec-dev-usore-10971-datastore-02"
-  hierarchical_parent_max_tokens = 8192
-  hierarchical_child_max_tokens  = 2048
-  hierarchical_overlap_tokens    = 60
-  kb_oss_collection_name   = null           # Leave as null to use the default OpenSearch value "bedrock-resource-kb", or replace with a custom name 
+########################################
+# IAM Role for Bedrock Knowledge Base
+########################################
+resource "aws_iam_role" "bedrock_kb" {
+  name = "BedrockKBRole-${var.kb_name}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "bedrock.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      }
+    ]
+  })
 }
 
-output "account_id" {
-  value = module.knowledge_base.account_id
+########################################
+# IAM Policy – Claude Opus inference profile
+########################################
+resource "aws_iam_role_policy" "bedrock_kb_claude_opus" {
+  name = "BedrockKBClaudeOpusParsing-${var.kb_name}"
+  role = aws_iam_role.bedrock_kb.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowClaudeOpusInferenceProfile"
+        Effect = "Allow"
+        Action = [
+          "bedrock:GetInferenceProfile",
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream"
+        ]
+        Resource = local.claude_opus_inference_profile_arn
+      }
+    ]
+  })
 }
 
-output "partition" {
-  value = module.knowledge_base.partition
+########################################
+# IAM Policy – Titan embedding model
+########################################
+resource "aws_iam_role_policy" "bedrock_kb_titan_embeddings" {
+  name = "BedrockKBTitanEmbeddings-${var.kb_name}"
+  role = aws_iam_role.bedrock_kb.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowTitanEmbeddingModel"
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel"
+        ]
+        Resource = local.bedrock_embedding_model_arn
+      }
+    ]
+  })
 }
 
-output "region" {
-  value = module.knowledge_base.region
+########################################
+# S3 Data Source
+########################################
+data "aws_s3_bucket" "kb" {
+  bucket = var.kb_s3_bucket_name_prefix
 }
 
-output "bedrockarn" {
-  value = module.knowledge_base.bedrockarn
+########################################
+# OpenSearch Serverless Policies
+########################################
+resource "aws_opensearchserverless_security_policy" "encryption" {
+  name = var.kb_oss_collection_name
+  type = "encryption"
+
+  policy = jsonencode({
+    Rules = [
+      {
+        ResourceType = "collection"
+        Resource     = ["collection/${var.kb_oss_collection_name}"]
+      }
+    ]
+    AWSOwnedKey = true
+  })
 }
 
-output "s3_bucket_name" {
-  value = module.knowledge_base.s3_bucket_name
+resource "aws_opensearchserverless_security_policy" "network" {
+  name = var.kb_oss_collection_name
+  type = "network"
+
+  policy = jsonencode([
+    {
+      Rules = [
+        {
+          ResourceType = "collection"
+          Resource     = ["collection/${var.kb_oss_collection_name}"]
+        },
+        {
+          ResourceType = "dashboard"
+          Resource     = ["collection/${var.kb_oss_collection_name}"]
+        }
+      ]
+      AllowFromPublic = true
+    }
+  ])
 }
 
-output "knowledge_base_id" {
-  value       = module.knowledge_base.knowledge_base_id
-  description = "The ID of the Knowledge Base"
+########################################
+# OpenSearch Serverless Collection
+########################################
+resource "aws_opensearchserverless_collection" "kb" {
+  name = var.kb_oss_collection_name
+  type = "VECTORSEARCH"
+
+  depends_on = [
+    aws_opensearchserverless_security_policy.encryption,
+    aws_opensearchserverless_security_policy.network
+  ]
 }
 
-output "knowledge_base_ARN" {
-  value       = module.knowledge_base.knowledge_base_ARN
-  description = "The ARN of the Knowledge Base"
+########################################
+# OpenSearch Provider
+########################################
+provider "opensearch" {
+  url         = aws_opensearchserverless_collection.kb.collection_endpoint
+  healthcheck = false
+}
+
+########################################
+# OpenSearch Vector Index
+########################################
+resource "opensearch_index" "kb" {
+  name      = "bedrock-knowledge-base-default-index"
+  index_knn = true
+
+  mappings = <<EOF
+{
+  "properties": {
+    "bedrock-knowledge-base-default-vector": {
+      "type": "knn_vector",
+      "dimension": 1024
+    },
+    "AMAZON_BEDROCK_TEXT_CHUNK": {
+      "type": "text"
+    },
+    "AMAZON_BEDROCK_METADATA": {
+      "type": "text",
+      "index": false
+    }
+  }
+}
+EOF
+}
+
+########################################
+# Bedrock Knowledge Base
+########################################
+resource "aws_bedrockagent_knowledge_base" "kb" {
+  name     = var.kb_name
+  role_arn = aws_iam_role.bedrock_kb.arn
+
+  knowledge_base_configuration {
+    type = "VECTOR"
+
+    vector_knowledge_base_configuration {
+      embedding_model_arn = local.bedrock_embedding_model_arn
+    }
+  }
+
+  storage_configuration {
+    type = "OPENSEARCH_SERVERLESS"
+
+    opensearch_serverless_configuration {
+      collection_arn    = aws_opensearchserverless_collection.kb.arn
+      vector_index_name = opensearch_index.kb.name
+
+      field_mapping {
+        vector_field   = "bedrock-knowledge-base-default-vector"
+        text_field     = "AMAZON_BEDROCK_TEXT_CHUNK"
+        metadata_field = "AMAZON_BEDROCK_METADATA"
+      }
+    }
+  }
+}
+
+########################################
+# Bedrock Data Source + Parsing + Chunking
+########################################
+resource "aws_bedrockagent_data_source" "kb" {
+  knowledge_base_id = aws_bedrockagent_knowledge_base.kb.id
+  name              = "${var.kb_name}-ds"
+
+  data_source_configuration {
+    type = "S3"
+
+    s3_configuration {
+      bucket_arn = data.aws_s3_bucket.kb.arn
+    }
+  }
+
+  vector_ingestion_configuration {
+
+    # Claude Opus parses documents
+    parsing_configuration {
+      parsing_strategy = "BEDROCK_FOUNDATION_MODEL"
+
+      bedrock_foundation_model_configuration {
+        model_arn = local.claude_opus_inference_profile_arn
+      }
+    }
+
+    # Hierarchical chunking
+    chunking_configuration {
+      chunking_strategy = var.chunking_strategy
+
+      hierarchical_chunking_configuration {
+        overlap_tokens = var.hierarchical_overlap_tokens
+
+        level_configuration {
+          max_tokens = var.hierarchical_parent_max_tokens
+        }
+
+        level_configuration {
+          max_tokens = var.hierarchical_child_max_tokens
+        }
+      }
+    }
+  }
 }
